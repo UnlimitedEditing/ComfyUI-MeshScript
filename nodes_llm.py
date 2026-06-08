@@ -1,43 +1,44 @@
 """
 ComfyUI-MeshScript — LLM generation nodes.
 
-    MeshScriptLLMLoader     Load a GGUF model via llama_cpp
+    MeshScriptLLMLoader     Load a HuggingFace causal-LM model via transformers
     MeshScriptLLMGen        Text prompt → MeshScript  (txt2mesh)
     MeshScriptLLMRevise     Script + edit instruction → revised MeshScript (mesh2mesh)
 
-Requires:  llama-cpp-python  (GPU: install with matching CUDA wheel — see pre_install_script)
-Model dir: {ComfyUI}/models/llm/   (*.gguf files)
+Requires:  transformers  accelerate
+           (torch is already present on Graydient — device_map="auto" uses the GPU)
+
+Model dir: HF cache is routed to {ComfyUI}/models/llm/hf_cache/ so downloads persist
+           between Graydient runs.  Default model: Qwen/Qwen2.5-Coder-7B-Instruct
 """
 
 import os
 import re
-import sys
 
 import folder_paths
-
 from .nodes import _MS_ROOT
 
-# ── llama_cpp lazy import ─────────────────────────────────────────────────────
+# ── lazy imports ──────────────────────────────────────────────────────────────
 
-_LLAMA_AVAILABLE = False
+_TRANSFORMERS_AVAILABLE = False
 try:
-    from llama_cpp import Llama
-    _LLAMA_AVAILABLE = True
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    _TRANSFORMERS_AVAILABLE = True
 except ImportError:
-    print("[ComfyUI-MeshScript] llama_cpp not installed — LLM nodes will error at runtime. "
-          "Install via pre_install_script or: pip install llama-cpp-python")
+    print("[ComfyUI-MeshScript] transformers/torch not available — "
+          "LLM nodes will error at runtime. "
+          "Add 'transformers' and 'accelerate' to requirements.pip.")
 
-# ── register models/llm folder ───────────────────────────────────────────────
+# ── persistent HF cache inside models dir ────────────────────────────────────
 
 _LLM_DIR = os.path.join(folder_paths.models_dir, "llm")
 os.makedirs(_LLM_DIR, exist_ok=True)
-if "llm" not in folder_paths.folder_names_and_paths:
-    folder_paths.add_model_folder_path("llm", _LLM_DIR)
+_HF_CACHE = os.path.join(_LLM_DIR, "hf_cache")
 
-# ── context level constants ───────────────────────────────────────────────────
+# ── context levels ────────────────────────────────────────────────────────────
 
 CONTEXT_LEVELS = ["base", "+patterns", "+reference", "+all"]
-
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -66,43 +67,63 @@ def _system_prompt(context_level: str) -> str:
 
 
 def _extract_script(text: str) -> str:
-    """Strip <think> blocks (Qwen3/reasoning models), then pull first ```python fence."""
+    """Strip <think> blocks (reasoning models), then pull first ```python fence."""
     text = re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE).strip()
     m = re.search(r"```(?:python|meshscript)\s*\n([\s\S]+?)```", text)
     return m.group(1).strip() if m else ""
 
 
-def _run_llm(llm, messages: list, temperature: float, max_tokens: int) -> str:
-    resp = llm.create_chat_completion(
-        messages   = messages,
-        temperature = temperature,
-        max_tokens  = max_tokens,
+def _chat_complete(model_pack, messages: list, temperature: float,
+                   max_tokens: int) -> str:
+    """Run a chat completion using transformers generate."""
+    model, tokenizer = model_pack
+
+    # Apply the model's chat template (handles system/user/assistant roles)
+    text = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
     )
-    return resp["choices"][0]["message"]["content"]
+    inputs = tokenizer(text, return_tensors="pt").to(model.device)
+
+    gen_kwargs = dict(
+        max_new_tokens   = max_tokens,
+        pad_token_id     = tokenizer.eos_token_id,
+        eos_token_id     = tokenizer.eos_token_id,
+    )
+    if temperature > 0:
+        gen_kwargs.update(do_sample=True, temperature=temperature)
+    else:
+        gen_kwargs["do_sample"] = False
+
+    with torch.no_grad():
+        output_ids = model.generate(**inputs, **gen_kwargs)
+
+    # Return only the newly generated tokens
+    new_ids = output_ids[0][inputs.input_ids.shape[1]:]
+    return tokenizer.decode(new_ids, skip_special_tokens=True)
 
 
 # ── Node: MeshScriptLLMLoader ─────────────────────────────────────────────────
 
 class MeshScriptLLMLoader:
     """
-    Load a GGUF LLM model for MeshScript generation.
-    Place *.gguf files in  {ComfyUI}/models/llm/
+    Load a HuggingFace causal-LM for MeshScript generation.
+    The model is downloaded on first use and cached in {ComfyUI}/models/llm/hf_cache/
+    so subsequent runs skip the download.
+
+    Default: Qwen/Qwen2.5-Coder-7B-Instruct  (~14 GB, bfloat16, runs on RTX 4090/5090)
     """
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "model_filename": ("STRING", {
-                    "default": "qwen2.5-coder-7b-instruct-q4_k_m.gguf",
-                    "tooltip": "GGUF filename inside {ComfyUI}/models/llm/",
+                "model_id": ("STRING", {
+                    "default":  "Qwen/Qwen2.5-Coder-7B-Instruct",
+                    "tooltip":  "HuggingFace model ID or local path",
                 }),
-                "n_ctx": ("INT", {
-                    "default": 4096, "min": 512, "max": 32768, "step": 512,
-                }),
-                "n_gpu_layers": ("INT", {
-                    "default": -1, "min": -1, "max": 200,
-                    "tooltip": "-1 = all layers on GPU",
+                "dtype": (["bfloat16", "float16", "float32"], {
+                    "default": "bfloat16",
+                    "tooltip": "bfloat16 recommended — ~14 GB VRAM for 7B",
                 }),
             }
         }
@@ -112,26 +133,33 @@ class MeshScriptLLMLoader:
     FUNCTION      = "load"
     CATEGORY      = "MeshScript"
 
-    def load(self, model_filename: str, n_ctx: int, n_gpu_layers: int):
-        if not _LLAMA_AVAILABLE:
-            raise RuntimeError("llama_cpp is not installed — cannot load model.")
-
-        model_path = os.path.join(_LLM_DIR, model_filename)
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(
-                f"Model not found: {model_path}\n"
-                f"Place a GGUF file in {_LLM_DIR}"
+    def load(self, model_id: str, dtype: str):
+        if not _TRANSFORMERS_AVAILABLE:
+            raise RuntimeError(
+                "transformers is not installed.\n"
+                "Add 'transformers' and 'accelerate' to requirements.pip."
             )
 
-        print(f"[MeshScriptLLMLoader] loading {model_filename} "
-              f"(n_ctx={n_ctx}, n_gpu_layers={n_gpu_layers})")
-        llm = Llama(
-            model_path    = model_path,
-            n_ctx         = n_ctx,
-            n_gpu_layers  = n_gpu_layers,
-            verbose       = False,
+        # Route HF downloads to the persistent models directory
+        os.environ["HF_HOME"] = _HF_CACHE
+
+        dtype_map = {
+            "bfloat16": torch.bfloat16,
+            "float16":  torch.float16,
+            "float32":  torch.float32,
+        }
+
+        print(f"[MeshScriptLLMLoader] loading {model_id!r} ({dtype})")
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype   = dtype_map[dtype],
+            device_map    = "auto",   # places layers on GPU automatically
         )
-        return (llm,)
+        model.eval()
+        device = next(model.parameters()).device
+        print(f"[MeshScriptLLMLoader] loaded — device: {device}")
+        return ((model, tokenizer),)
 
 
 # ── Node: MeshScriptLLMGen ────────────────────────────────────────────────────
@@ -149,7 +177,7 @@ class MeshScriptLLMGen:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "model":         ("MS_LLM",),
+                "model": ("MS_LLM",),
                 "prompt": ("STRING", {
                     "multiline": True,
                     "default":   "a coffee mug",
@@ -182,7 +210,7 @@ class MeshScriptLLMGen:
                 ),
             },
         ]
-        raw    = _run_llm(model, messages, temperature, max_tokens)
+        raw    = _chat_complete(model, messages, temperature, max_tokens)
         script = _extract_script(raw)
         if not script:
             raise RuntimeError(
@@ -246,7 +274,7 @@ class MeshScriptLLMRevise:
                 ),
             },
         ]
-        raw    = _run_llm(model, messages, temperature, max_tokens)
+        raw        = _chat_complete(model, messages, temperature, max_tokens)
         new_script = _extract_script(raw)
         if not new_script:
             raise RuntimeError(
