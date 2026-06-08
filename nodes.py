@@ -208,15 +208,21 @@ class MeshScriptExecute:
 
         result = ms_run(script, reference=spec, render_config=render_config, export_dir=None)
 
-        if not result["success"] or not result["checkpoints"]:
-            err = result.get("error") or "no checkpoints produced"
-            return (None, torch.zeros(1, 64, 64, 3), script, err, False)
-
-        mesh    = result["final"]
-        renders = result["checkpoints"][-1].get("renders", [])
+        # Use the last checkpoint mesh even on partial failure — if any show()
+        # calls ran we have valid geometry worth returning.  The error string
+        # travels on the error output pin so the caller can decide what to do.
+        mesh    = result.get("final")   # checkpoints[-1].mesh, or None
+        renders = (result["checkpoints"][-1].get("renders", [])
+                   if result["checkpoints"] else [])
         img_t   = _renders_to_tensor(renders)
+        err     = result.get("error") or ""
+        success = bool(result.get("success"))
 
-        return (mesh, img_t, script, "", True)
+        if mesh is None:
+            return (None, img_t, script,
+                    err or "script produced no geometry (no show() calls)", False)
+
+        return (mesh, img_t, script, err, success)
 
 
 # ── Node: SaveMeshWithScript ──────────────────────────────────────────────────
