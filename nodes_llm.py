@@ -84,6 +84,15 @@ def _chat_complete(model_pack, messages: list, temperature: float,
     )
     inputs = tokenizer(text, return_tensors="pt").to(model.device)
 
+    print(f"[_chat_complete] prompt_tokens={inputs.input_ids.shape[1]}  "
+          f"max_new_tokens={max_tokens}  temperature={temperature}")
+    for m in messages:
+        content = m["content"]
+        preview = content if len(content) <= 2000 else (
+            content[:2000] + f"\n... <{len(content) - 2000} more chars>"
+        )
+        print(f"[_chat_complete] -- {m['role']} message ({len(content)} chars) --\n{preview}")
+
     gen_kwargs = dict(
         max_new_tokens   = max_tokens,
         pad_token_id     = tokenizer.eos_token_id,
@@ -99,7 +108,14 @@ def _chat_complete(model_pack, messages: list, temperature: float,
 
     # Return only the newly generated tokens
     new_ids = output_ids[0][inputs.input_ids.shape[1]:]
-    return tokenizer.decode(new_ids, skip_special_tokens=True)
+    raw = tokenizer.decode(new_ids, skip_special_tokens=True)
+
+    truncated = new_ids.shape[0] >= max_tokens
+    print(f"[_chat_complete] generated {new_ids.shape[0]} tokens ({len(raw)} chars)"
+          + (" -- HIT max_new_tokens, output likely truncated" if truncated else ""))
+    print(f"[_chat_complete] -- raw output --\n{raw}")
+
+    return raw
 
 
 # ── Node: MeshScriptLLMLoader ─────────────────────────────────────────────────
@@ -196,6 +212,9 @@ class MeshScriptLLMGen:
 
     def generate(self, model, prompt: str, context_level: str,
                  temperature: float, max_tokens: int):
+        print(f"[MeshScriptLLMGen] received prompt ({len(prompt)} chars): {prompt!r}")
+        print(f"[MeshScriptLLMGen] context_level={context_level!r}  "
+              f"temperature={temperature}  max_tokens={max_tokens}")
         sys_prompt = _system_prompt(context_level)
         messages = [
             {"role": "system", "content": sys_prompt},
@@ -216,7 +235,8 @@ class MeshScriptLLMGen:
             raise RuntimeError(
                 f"LLM did not produce a fenced code block.\nRaw response:\n{raw[:500]}"
             )
-        print(f"[MeshScriptLLMGen] generated {len(script)} chars")
+        print(f"[MeshScriptLLMGen] extracted script ({len(script)} chars, "
+              f"{script.count('show(')} show() calls):\n{script}")
         return (script, prompt)
 
 
@@ -258,6 +278,11 @@ class MeshScriptLLMRevise:
 
     def revise(self, model, script: str, spec: str, edit_prompt: str,
                context_level: str, temperature: float, max_tokens: int):
+        print(f"[MeshScriptLLMRevise] received edit_prompt ({len(edit_prompt)} chars): {edit_prompt!r}")
+        print(f"[MeshScriptLLMRevise] context_level={context_level!r}  "
+              f"temperature={temperature}  max_tokens={max_tokens}")
+        print(f"[MeshScriptLLMRevise] incoming spec={spec!r}")
+        print(f"[MeshScriptLLMRevise] incoming script ({len(script)} chars):\n{script}")
         sys_prompt = _system_prompt(context_level)
         messages = [
             {"role": "system", "content": sys_prompt},
@@ -280,7 +305,8 @@ class MeshScriptLLMRevise:
             raise RuntimeError(
                 f"LLM did not produce a fenced code block.\nRaw response:\n{raw[:500]}"
             )
-        print(f"[MeshScriptLLMRevise] revised script: {len(new_script)} chars")
+        print(f"[MeshScriptLLMRevise] extracted revised script ({len(new_script)} chars, "
+              f"{new_script.count('show(')} show() calls):\n{new_script}")
         return (new_script, edit_prompt)
 
 

@@ -206,6 +206,12 @@ class MeshScriptExecute:
                 "height": render_size,
             }
 
+        print(f"[MeshScriptExecute] spec={spec!r}")
+        print(f"[MeshScriptExecute] script ({len(script)} chars, "
+              f"{script.count('show(')} show() calls):")
+        for i, line in enumerate(script.splitlines(), 1):
+            print(f"  {i:3d} | {line}")
+
         result = ms_run(script, reference=spec, render_config=render_config, export_dir=None)
 
         # Use the last checkpoint mesh even on partial failure — if any show()
@@ -217,6 +223,11 @@ class MeshScriptExecute:
         img_t   = _renders_to_tensor(renders)
         err     = result.get("error") or ""
         success = bool(result.get("success"))
+
+        print(f"[MeshScriptExecute] success={success}  "
+              f"checkpoints={len(result['checkpoints'])}")
+        if err:
+            print(f"[MeshScriptExecute] execution error:\n{err}")
 
         if mesh is None:
             return (None, img_t, script,
