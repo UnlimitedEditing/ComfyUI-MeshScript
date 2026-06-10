@@ -3,3 +3,4 @@ numpy
 Pillow
 transformers
 accelerate
+lm-format-enforcer
