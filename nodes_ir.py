@@ -4,7 +4,7 @@ ComfyUI-MeshScript — nodes_ir.py
 Structured-output ("IR") generation nodes. Instead of asking the LLM to write
 free-form CanvasScript/MeshScript and hoping the syntax and op usage are
 valid, generation is constrained token-by-token to a JSON Schema (ir.schema)
-via lm-format-enforcer. The resulting IR JSON is then semantically validated
+via xgrammar. The resulting IR JSON is then semantically validated
 (ir.validate) — checking $ref ordering and Document/Layer/Mesh type
 compatibility between steps — with a bounded retry-with-feedback loop, and
 finally compiled (ir.compile) into plain .cnv / .ms source text that plugs
@@ -12,7 +12,7 @@ into the existing CanvasScriptExecute / MeshScriptExecute nodes unchanged.
 
     CanvasScriptLLMGenIR    Text prompt -> CanvasScript IR -> .cnv script
 
-Requires:  transformers  accelerate  lm-format-enforcer
+Requires:  transformers  accelerate  xgrammar
 """
 
 import json
@@ -20,32 +20,81 @@ import os
 
 from .nodes import _MS_ROOT
 
-_LMFE_AVAILABLE = False
-_LMFE_IMPORT_ERROR = None
+_XGR_AVAILABLE = False
+_XGR_IMPORT_ERROR = None
 try:
     import torch
-
-    # lm-format-enforcer 0.11.3 (latest on PyPI) imports
-    # `PreTrainedTokenizerBase` from `transformers.tokenization_utils`, which
-    # was moved to `transformers.tokenization_utils_base` in transformers 5.x.
-    # Shim the old location back in before importing lmformatenforcer's
-    # transformers integration so its import succeeds unmodified.
-    import transformers.tokenization_utils as _tf_tok_utils
-    if not hasattr(_tf_tok_utils, "PreTrainedTokenizerBase"):
-        from transformers.tokenization_utils_base import PreTrainedTokenizerBase as _PTB
-        _tf_tok_utils.PreTrainedTokenizerBase = _PTB
-
-    from lmformatenforcer import JsonSchemaParser
-    from lmformatenforcer.integrations.transformers import build_transformers_prefix_allowed_tokens_fn
-    _LMFE_AVAILABLE = True
+    import xgrammar as xgr
+    from xgrammar.contrib.hf import LogitsProcessor as _XGRLogitsProcessor
+    _XGR_AVAILABLE = True
 except Exception as e:
-    _LMFE_IMPORT_ERROR = e
+    _XGR_IMPORT_ERROR = e
     import traceback
-    print("[ComfyUI-MeshScript] lm-format-enforcer/transformers/torch not available — "
+    print("[ComfyUI-MeshScript] xgrammar/transformers/torch not available — "
           "IR generation nodes will error at runtime. "
-          "Add 'lm-format-enforcer', 'transformers' and 'accelerate' to requirements.pip.\n"
+          "Add 'xgrammar', 'transformers' and 'accelerate' to requirements.pip.\n"
           f"[ComfyUI-MeshScript] import error: {e!r}\n"
           + traceback.format_exc())
+
+
+if _XGR_AVAILABLE:
+    class _TorchNativeXGRProcessor(_XGRLogitsProcessor):
+        """xgrammar's HF LogitsProcessor, but applies the token bitmask via
+        the 'torch_native' backend instead of the default 'triton' backend.
+
+        The default backend requires Triton, which has no Windows wheel and
+        is an extra (large) dependency on Linux. 'torch_native' is portable
+        and, since the bitmask itself is precomputed by xgrammar's compiled
+        grammar matcher, applying it is a cheap vectorized op regardless —
+        measured at near-zero overhead vs. unconstrained generation.
+        """
+
+        def __call__(self, input_ids, scores):
+            if len(self.matchers) == 0:
+                self.batch_size = input_ids.shape[0]
+                self.compiled_grammars = (
+                    self.compiled_grammars
+                    if len(self.compiled_grammars) > 1
+                    else self.compiled_grammars * self.batch_size
+                )
+                self.matchers = [
+                    xgr.GrammarMatcher(self.compiled_grammars[i]) for i in range(self.batch_size)
+                ]
+                self.token_bitmask = xgr.allocate_token_bitmask(self.batch_size, self.full_vocab_size)
+
+            if not self.prefilled:
+                self.prefilled = True
+            else:
+                for i in range(self.batch_size):
+                    if not self.matchers[i].is_terminated():
+                        sampled_token = input_ids[i][-1].item()
+                        assert self.matchers[i].accept_token(sampled_token)
+
+            for i in range(self.batch_size):
+                if not self.matchers[i].is_terminated():
+                    self.matchers[i].fill_next_token_bitmask(self.token_bitmask, i)
+
+            xgr.apply_token_bitmask_inplace(
+                scores, self.token_bitmask.to(scores.device), backend="torch_native"
+            )
+            return scores
+
+
+    # Compiling a grammar from a JSON Schema takes ~0.1s — cheap, but the
+    # schema is identical across every generate()/retry call for a given
+    # node, so cache the compiled grammar per (tokenizer, schema).
+    _grammar_cache: dict = {}
+
+    def _compiled_grammar(model, tokenizer, schema: dict):
+        key = (id(tokenizer), json.dumps(schema, sort_keys=True))
+        cg = _grammar_cache.get(key)
+        if cg is None:
+            tokenizer_info = xgr.TokenizerInfo.from_huggingface(
+                tokenizer, vocab_size=model.config.vocab_size
+            )
+            cg = xgr.GrammarCompiler(tokenizer_info).compile_json_schema(schema)
+            _grammar_cache[key] = cg
+        return cg
 
 
 _CANVAS_GENERATED_MARKER = (
@@ -98,17 +147,17 @@ def _constrained_generate(model_pack, messages, schema, temperature, max_tokens)
     )
     inputs = tokenizer(text, return_tensors="pt").to(model.device)
 
-    parser = JsonSchemaParser(schema)
-    prefix_fn = build_transformers_prefix_allowed_tokens_fn(tokenizer, parser)
+    compiled_grammar = _compiled_grammar(model, tokenizer, schema)
+    xgr_processor = _TorchNativeXGRProcessor(compiled_grammar)
 
     print(f"[_constrained_generate] prompt_tokens={inputs.input_ids.shape[1]}  "
           f"max_new_tokens={max_tokens}  temperature={temperature}")
 
     gen_kwargs = dict(
-        max_new_tokens          = max_tokens,
-        pad_token_id            = tokenizer.eos_token_id,
-        eos_token_id            = tokenizer.eos_token_id,
-        prefix_allowed_tokens_fn = prefix_fn,
+        max_new_tokens   = max_tokens,
+        pad_token_id     = tokenizer.eos_token_id,
+        eos_token_id     = tokenizer.eos_token_id,
+        logits_processor = [xgr_processor],
     )
     if temperature > 0:
         gen_kwargs.update(do_sample=True, temperature=temperature)
@@ -163,11 +212,11 @@ class CanvasScriptLLMGenIR:
     CATEGORY      = "CanvasScript"
 
     def generate(self, model, prompt: str, temperature: float, max_tokens: int, max_retries: int):
-        if not _LMFE_AVAILABLE:
+        if not _XGR_AVAILABLE:
             raise RuntimeError(
-                "lm-format-enforcer is not installed.\n"
-                "Add 'lm-format-enforcer', 'transformers' and 'accelerate' to requirements.pip.\n"
-                f"Import error was: {_LMFE_IMPORT_ERROR!r}"
+                "xgrammar is not installed.\n"
+                "Add 'xgrammar', 'transformers' and 'accelerate' to requirements.pip.\n"
+                f"Import error was: {_XGR_IMPORT_ERROR!r}"
             )
         if _MS_ROOT is None:
             raise RuntimeError("meshscript library not found — set MESHSCRIPT_PATH")
@@ -265,11 +314,11 @@ class MeshScriptLLMGenIR:
     CATEGORY      = "MeshScript"
 
     def generate(self, model, prompt: str, temperature: float, max_tokens: int, max_retries: int):
-        if not _LMFE_AVAILABLE:
+        if not _XGR_AVAILABLE:
             raise RuntimeError(
-                "lm-format-enforcer is not installed.\n"
-                "Add 'lm-format-enforcer', 'transformers' and 'accelerate' to requirements.pip.\n"
-                f"Import error was: {_LMFE_IMPORT_ERROR!r}"
+                "xgrammar is not installed.\n"
+                "Add 'xgrammar', 'transformers' and 'accelerate' to requirements.pip.\n"
+                f"Import error was: {_XGR_IMPORT_ERROR!r}"
             )
         if _MS_ROOT is None:
             raise RuntimeError("meshscript library not found — set MESHSCRIPT_PATH")
