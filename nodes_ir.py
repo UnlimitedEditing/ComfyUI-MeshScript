@@ -21,15 +21,31 @@ import os
 from .nodes import _MS_ROOT
 
 _LMFE_AVAILABLE = False
+_LMFE_IMPORT_ERROR = None
 try:
     import torch
+
+    # lm-format-enforcer 0.11.3 (latest on PyPI) imports
+    # `PreTrainedTokenizerBase` from `transformers.tokenization_utils`, which
+    # was moved to `transformers.tokenization_utils_base` in transformers 5.x.
+    # Shim the old location back in before importing lmformatenforcer's
+    # transformers integration so its import succeeds unmodified.
+    import transformers.tokenization_utils as _tf_tok_utils
+    if not hasattr(_tf_tok_utils, "PreTrainedTokenizerBase"):
+        from transformers.tokenization_utils_base import PreTrainedTokenizerBase as _PTB
+        _tf_tok_utils.PreTrainedTokenizerBase = _PTB
+
     from lmformatenforcer import JsonSchemaParser
     from lmformatenforcer.integrations.transformers import build_transformers_prefix_allowed_tokens_fn
     _LMFE_AVAILABLE = True
-except ImportError:
+except Exception as e:
+    _LMFE_IMPORT_ERROR = e
+    import traceback
     print("[ComfyUI-MeshScript] lm-format-enforcer/transformers/torch not available — "
           "IR generation nodes will error at runtime. "
-          "Add 'lm-format-enforcer', 'transformers' and 'accelerate' to requirements.pip.")
+          "Add 'lm-format-enforcer', 'transformers' and 'accelerate' to requirements.pip.\n"
+          f"[ComfyUI-MeshScript] import error: {e!r}\n"
+          + traceback.format_exc())
 
 
 _CANVAS_GENERATED_MARKER = (
@@ -150,7 +166,8 @@ class CanvasScriptLLMGenIR:
         if not _LMFE_AVAILABLE:
             raise RuntimeError(
                 "lm-format-enforcer is not installed.\n"
-                "Add 'lm-format-enforcer', 'transformers' and 'accelerate' to requirements.pip."
+                "Add 'lm-format-enforcer', 'transformers' and 'accelerate' to requirements.pip.\n"
+                f"Import error was: {_LMFE_IMPORT_ERROR!r}"
             )
         if _MS_ROOT is None:
             raise RuntimeError("meshscript library not found — set MESHSCRIPT_PATH")
@@ -251,7 +268,8 @@ class MeshScriptLLMGenIR:
         if not _LMFE_AVAILABLE:
             raise RuntimeError(
                 "lm-format-enforcer is not installed.\n"
-                "Add 'lm-format-enforcer', 'transformers' and 'accelerate' to requirements.pip."
+                "Add 'lm-format-enforcer', 'transformers' and 'accelerate' to requirements.pip.\n"
+                f"Import error was: {_LMFE_IMPORT_ERROR!r}"
             )
         if _MS_ROOT is None:
             raise RuntimeError("meshscript library not found — set MESHSCRIPT_PATH")
